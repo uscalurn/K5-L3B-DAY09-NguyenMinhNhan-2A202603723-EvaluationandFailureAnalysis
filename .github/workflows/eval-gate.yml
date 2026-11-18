@@ -6,12 +6,32 @@ jobs:
   # The starter repo has no src/lab8; its CI only runs after src/ of the Day 8 repo is copied into the fork.
   detect:
     runs-on: ubuntu-latest
-    outputs: {lab8: "${{ steps.has.outputs.lab8 }}"}
+    outputs:
+      lab8: "${{ steps.has.outputs.lab8 }}"
+      base_sha: "${{ steps.base.outputs.sha }}"
     steps:
       - uses: actions/checkout@v7
         with: {persist-credentials: false}
       - id: has
         run: "test -d src/lab8 && echo lab8=1 >> \"$GITHUB_OUTPUT\" || echo skip, overlay without src/lab8"
+      - name: Checkout trusted PR base (default branch for manual runs)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+          path: .trusted-base
+          persist-credentials: false
+      - id: base
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base_sha=$(git -C .trusted-base rev-parse HEAD)
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            test -n "$EXPECTED_BASE_SHA"
+            test "$base_sha" = "$EXPECTED_BASE_SHA"
+          fi
+          printf 'sha=%s\n' "$base_sha" >> "$GITHUB_OUTPUT"
 
   eval-gate:
     needs: detect
@@ -23,10 +43,19 @@ jobs:
       EVAL_SPEC: config/metric_spec.yaml
       # Committed by the student after M4 (re-run on main, never hand-edited).
       EVAL_BASELINE: reports/baseline_v1.json
+      EVAL_BASE_SPEC: ${{ github.workspace }}/.trusted-base/src/config/metric_spec.yaml
     defaults: {run: {working-directory: src}}
     steps:
       - uses: actions/checkout@v7
         with: {persist-credentials: false}
+      - name: Checkout pinned trusted base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.detect.outputs.base_sha }}
+          path: .trusted-base
+          persist-credentials: false
+      - name: Require trusted metric spec
+        run: test -f "$EVAL_BASE_SPEC"
       # setup-uv publishes only full tags (no @v10); pin the SHA.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with: {python-version: "3.13", activate-environment: true, enable-cache: true, cache-dependency-glob: "src/requirements*.txt"}
@@ -38,20 +67,20 @@ jobs:
         shell: bash
         run: |
           python -m lab9.eval --shape swarm --spec "$EVAL_SPEC" --out reports/eval_pr.json
-          python -m lab9.gate --pr reports/eval_pr.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC"
+          python -m lab9.gate --pr reports/eval_pr.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC" --base-spec "$EVAL_BASE_SPEC"
       - name: Check the committed baseline and the M3 metric
         run: python -m lab9.ci_check --pr reports/eval_pr.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC"
       - name: Verify the gate accepts fixed
         shell: bash
         run: |
           python -m lab9.eval --shape fixed --spec "$EVAL_SPEC" --out reports/eval_fixed.json
-          python -m lab9.gate --pr reports/eval_fixed.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC"
+          python -m lab9.gate --pr reports/eval_fixed.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC" --base-spec "$EVAL_BASE_SPEC"
       - name: Verify the gate blocks seeded_regression
         shell: bash
         run: |
           python -m lab9.eval --shape seeded_regression --spec "$EVAL_SPEC" --out reports/eval_seeded_regression.json
           gate_status=0
-          gate_output=$(python -m lab9.gate --pr reports/eval_seeded_regression.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC") || gate_status=$?
+          gate_output=$(python -m lab9.gate --pr reports/eval_seeded_regression.json --baseline "$EVAL_BASELINE" --spec "$EVAL_SPEC" --base-spec "$EVAL_BASE_SPEC") || gate_status=$?
           printf '%s\n' "$gate_output"
           # A Python exception can also exit 1. Require the explicit pass_rate verdict.
           if [[ "$gate_status" -ne 1 ]] || ! grep -Eq '^exit 1 — blocked: ([^,]+, )*pass_rate(, |$)' <<< "$gate_output"; then
@@ -62,7 +91,7 @@ jobs:
   # Advanced/Expert (M5-M7). Runs only once the student commits reports/baseline_v2.json, so a
   # Core-only submission stays green. Exit 1 = a survived mutant or a false alarm.
   eval-gate-v2:
-    needs: eval-gate
+    needs: [detect, eval-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env: {PYTHONUTF8: "1"}
@@ -73,13 +102,48 @@ jobs:
       - id: has
         run: "test -f reports/baseline_v2.json && echo v2=1 >> \"$GITHUB_OUTPUT\" || echo skip, no baseline_v2"
       - if: steps.has.outputs.v2
+        name: Checkout pinned trusted base
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.detect.outputs.base_sha }}
+          path: .trusted-base
+          persist-credentials: false
+      - if: steps.has.outputs.v2
+        name: Select trusted v2 spec (v1 for a new v2 spec)
+        shell: bash
+        env:
+          TRUSTED_CONFIG: ${{ github.workspace }}/.trusted-base/src/config
+        run: |
+          base_spec="$TRUSTED_CONFIG/metric_spec_v2.yaml"
+          if [[ ! -f "$base_spec" ]]; then
+            base_spec="$TRUSTED_CONFIG/metric_spec.yaml"
+          fi
+          test -f "$base_spec"
+          printf 'EVAL_BASE_SPEC=%s\n' "$base_spec" >> "$GITHUB_ENV"
+      - if: steps.has.outputs.v2
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with: {python-version: "3.13", activate-environment: true, enable-cache: true, cache-dependency-glob: "src/requirements*.txt"}
       - if: steps.has.outputs.v2
         run: uv pip install -r requirements.txt -r requirements-lab9.txt
       - if: steps.has.outputs.v2
+        name: Validate v2 release floor
+        # The starter base may not define this new metric yet. Enforce the
+        # rubric minimum during bootstrap as well as ratcheting existing specs.
+        run: |
+          python - <<'PY'
+          import math
+          from pathlib import Path
+          from lab9.eval import load_spec
+          spec = load_spec(Path("config/metric_spec_v2.yaml"))
+          metric = next((m for m in spec["metrics"] if m["id"] == "pass_hat_5"), {})
+          floor = metric.get("threshold", {}).get("min")
+          if (metric.get("blocking") is not True or isinstance(floor, bool)
+                  or not isinstance(floor, (int, float)) or not math.isfinite(floor) or floor < 0.8):
+              raise SystemExit("INTEGRITY: pass_hat_5 must be blocking with min >= 0.8 (rubric)")
+          PY
+      - if: steps.has.outputs.v2
         run: python -m pytest -q -m student -o addopts= -k advanced
       - if: steps.has.outputs.v2
         run: python -m lab9.evalset --v2
       - if: steps.has.outputs.v2
-        run: python -m lab9.mutation --spec config/metric_spec_v2.yaml --baseline reports/baseline_v2.json
+        run: python -m lab9.mutation --spec config/metric_spec_v2.yaml --baseline reports/baseline_v2.json --base-spec "$EVAL_BASE_SPEC"

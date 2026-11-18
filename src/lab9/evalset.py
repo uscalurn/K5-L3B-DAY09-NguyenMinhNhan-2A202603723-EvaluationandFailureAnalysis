@@ -30,6 +30,49 @@ REQUIRED = ("item_id", "claim_id", "failure_modes", "provenance", "split", "eval
 FM_CODE = re.compile(r"FM-\d{2}")
 
 
+def failure_modes(claim: dict, claims: list[dict], world: dict) -> list[str]:
+    """Fixture coverage, not a prediction that the agent will fail this item.
+
+    Rules use facts, policy parts, prior refunds and principal scope; identifiers
+    are used only to join records. No answer is inferred from an identifier.
+    """
+    from lab8.compensation import quote
+    from lab8.config_loader import as_of
+    from lab8.mock_llm import parse_delay_days
+
+    modes = set()
+    if claim.get("parent_secret") or claim.get("raw_headers"):
+        modes.add("FM-01")
+    order = next((o for o in world.get("orders", []) if o["order_id"] == claim.get("order_id")), None)
+    if order is None:
+        return sorted(modes)
+    if order["principal_id"] != claim.get("principal_id"):
+        return sorted(modes | {"FM-09"})
+    delay = parse_delay_days(claim.get("ticket", ""))
+    if delay is not None and delay != order["delay_days"]:
+        modes.add("FM-03")
+    for policy in world.get("policies", []):
+        if not policy.get("is_current") or policy["effective_date"] > as_of():
+            if any(c["clause_id"] in claim.get("ticket", "") for c in policy["clauses"]):
+                modes.add("FM-06")
+    q = quote(order, world.get("policies", []), as_of=as_of())
+    if len(q.parts) > 1 or q.amount_vnd % 10000:
+        modes.add("FM-04")
+    prior = sum(r["amount_vnd"] for r in world.get("prior_refunds", []) if r["order_id"] == order["order_id"])
+    if q.amount_vnd > 0 and prior > 0:
+        modes.add("FM-05")
+    label = claim.get("expected", {})
+    if q.amount_vnd > 0 and label.get("policy_denied"):
+        modes.add("FM-02")
+    if label.get("status") == "resolved" and label.get("proposal_amount") != label.get("refund_vnd"):
+        modes.add("FM-08")
+    if q.amount_vnd > 0 and any(c["claim_id"] != claim["claim_id"]
+                               and c.get("order_id") == order["order_id"]
+                               and c.get("principal_id") == claim.get("principal_id") for c in claims):
+        modes.add("FM-07")
+    return sorted(modes)
+
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
@@ -40,17 +83,21 @@ def sha12(path: Path) -> str:
 
 def build(source: Path = SOURCE) -> tuple[int, int]:
     claims = load_jsonl(source)
+    world_path = source.parent / "public_world_state.json"
+    world = json.loads(world_path.read_text(encoding="utf-8")) if world_path.is_file() else {}
     items, labels = [], {}
     for n, claim in enumerate(claims, start=1):
         item_id = f"E-{n:03d}"
+        modes = failure_modes(claim, claims, world)
         items.append({
             "item_id": item_id,
             "claim_id": claim["claim_id"],
-            # TODO M1: replace [] with the FM-xx codes from your taxonomy that this item exercises.
-            "failure_modes": [],
+            "failure_modes": modes,
             "provenance": {"source": "lab8_public", "matrix_id": claim.get("matrix_id"),
-                           "from_trace": None, "generator": None,
-                           "label_by": "lab8_matrix", "checked_by": None},
+                           "from_trace": (f"traces/R-seeded_regression-{claim['claim_id']}-s11.json"
+                                          if "FM-03" in modes else None),
+                           "generator": "lab9.evalset.build:fixture_rules_v1",
+                           "label_by": "lab8_matrix", "checked_by": "fixture_rules_v1"},
             "split": "regression",
             "eval_set_version": VERSION,
         })
@@ -117,15 +164,24 @@ def check(items_path: Path = ITEMS, labels_path: Path = LABELS) -> list[str]:
             problems.append(f"{item['item_id']}: no label for {item.get('claim_id')}")
         if not item.get("failure_modes"):
             problems.append(f"{item['item_id']}: failure_modes empty (fill from taxonomy)")
+        if len(item.get("failure_modes") or []) != len(set(item.get("failure_modes") or [])):
+            problems.append(f"{item['item_id']}: duplicate failure-mode tag")
         problems += [f"{item['item_id']}: {fm} (fill config/fm_map.yaml)"
                      for fm in item.get("failure_modes") or [] if str(fm).startswith("UNMAPPED:")]
         problems += [f"{item['item_id']}: {fm!r} is not a failure-mode code like FM-03"
                      for fm in item.get("failure_modes") or []
                      if not str(fm).startswith("UNMAPPED:") and not FM_CODE.fullmatch(str(fm))]
+        if any(fm not in {f"FM-{n:02d}" for n in range(1, 10)} for fm in item.get("failure_modes") or []):
+            problems.append(f"{item['item_id']}: unknown taxonomy code")
+        provenance = item.get("provenance") or {}
+        if not all(provenance.get(k) for k in ("source", "label_by", "checked_by", "generator")):
+            problems.append(f"{item['item_id']}: incomplete provenance")
     ids = [it.get("item_id") for it in items]
     problems += [f"{i}: duplicate item_id" for i in sorted({i for i in ids if ids.count(i) > 1})]
     cids = [it.get("claim_id") for it in items]
     problems += [f"{c}: claim appears in more than one item" for c in sorted({c for c in cids if cids.count(c) > 1})]
+    if set(labels) != set(cids):
+        problems.append("labels and item claims must have the same identities")
     v2 = items_path == ITEMS_V2 or any(it.get("eval_set_version") == "v2" for it in items)
     if v2:
         problems += [f"{it.get('item_id')}: eval_set_version {it.get('eval_set_version')!r}, want 'v2'"
